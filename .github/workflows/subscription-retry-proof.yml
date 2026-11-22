@@ -1,0 +1,65 @@
+name: Subscription retry red-green proof
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: eugene-harold-krabs/openclaw
+          ref: 82f0ddb0854869b05c7312f941c6b234e044890c
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Set up the repository's supported Node and pnpm environment
+        uses: ./.github/actions/setup-node-env
+        with:
+          install-bun: "false"
+          cache-mode: "off"
+      - name: Prove the original error contract red on parent and green on head
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir proof
+          python3 - <<'PY'
+          import hashlib,json,pathlib,re,subprocess
+          head='82f0ddb0854869b05c7312f941c6b234e044890c'
+          base='6978b40e9d3812083064c97e24de00454d6bf868'
+          relative='src/gateway/server-methods/sessions-subscriptions.ts'
+          test='src/gateway/server-methods/sessions.messages-subscribe-approvals.test.ts'
+          path=pathlib.Path(relative);original=path.read_bytes()
+          assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==head
+          assert original==subprocess.check_output(['git','show',head+':'+relative])
+          before=subprocess.check_output(['git','show',base+':'+relative])
+          command=['node','scripts/run-vitest.mjs','run','--config','test/vitest/vitest.gateway-methods.config.ts',test,'--maxWorkers=1']
+          results={}
+          try:
+              for name,source in [('base',before),('head',original)]:
+                  path.write_bytes(source)
+                  result=subprocess.run(command,capture_output=True,text=True,timeout=480)
+                  output=re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]','',result.stdout+result.stderr)
+                  pathlib.Path('proof/'+name+'.log').write_text(output)
+                  results[name]={'exitCode':result.returncode,'handlerCommit':base if name=='base' else head,'handlerSha256':hashlib.sha256(source).hexdigest()}
+                  print(name,'exit',result.returncode,flush=True)
+                  if name=='base':
+                      assert result.returncode==1, 'base must fail an assertion, not setup'
+                      assert 'returns the session-change retry response' in output
+                      assert 'UNAVAILABLE' in output and 'INVALID_REQUEST' in output
+                      assert re.search(r'\b1 failed\b',output), 'one representative regression must fail'
+                  else:
+                      assert result.returncode==0 and re.search(r'\b9 passed\b',output)
+          finally:
+              path.write_bytes(original)
+              pathlib.Path('proof/receipt.json').write_text(json.dumps({'head':head,'prePatchParent':base,'testFile':test,'testSha256':hashlib.sha256(pathlib.Path(test).read_bytes()).hexdigest(),'command':command,'results':results,'boundary':'real subscription handler; replay failure injected by the existing regression; not browser/live Gateway proof'},indent=2))
+          PY
+      - name: Retain inspectable result and complete focused logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: subscription-retry-red-green
+          path: proof/
+          if-no-files-found: error
+          retention-days: 30
